@@ -141,6 +141,30 @@ class gcode_settings(bpy.types.PropertyGroup):
         default=(0.0, 0.0, 0.0)
     )
 
+    build_volume_x: IntProperty(
+        name = "",
+        description = "Size of buildplate in mm in the x direction, for centering the print",
+        default = 0
+        )
+    
+    build_volume_y: IntProperty(
+        name = "",
+        description = "Size of buildplate in mm in the y direction, for centering the print",
+        default = 0
+        )    
+
+    area_extrude: BoolProperty(
+        name="Area-based extrusion",
+        description="Extrusion based on segment area, toolpath based on centre of height edges, can reduce over/underextrusion artefacts after deformation",
+        default = False
+        )
+    
+    z_height_extrude: BoolProperty(
+        name="Z-height based extrusion",
+        description="Extrusion based on segment height (difference in z), toolpath based on centre of height edges, preserves line width after deformation",
+        default = False
+        )
+    
 
 
 
@@ -237,7 +261,19 @@ class NOZZLEBOSS_PT_Panel(bpy.types.Panel):
         row=col.row(align=True)
         row.label(text='End G-code:')
         row.prop_search(nozzleboss, "end", bpy.data, "texts", text="")   
-        
+      
+        col.separator(factor=2)
+
+        row = col.row(align=True)
+        col.prop(nozzleboss, 'area_extrude')
+        col.prop(nozzleboss, 'z_height_extrude')
+        col.separator(factor=2)
+
+        col.label(text='Build volume:')
+        row=col.row(align=True) #start new column in row mode (row mode every element gets put behind each other)
+        col.prop(nozzleboss, 'build_volume_x', text='X')
+        col.prop(nozzleboss, 'build_volume_y', text='Y')
+
         col.separator(factor=2)
         row=col.row(align=True) 
         #row.label(text='Start G-code:')
@@ -316,7 +352,10 @@ def export_gcode(context):
     nozzle_diameter = nozzleboss.nozzle_diameter
     extrusion_speed = nozzleboss.extrusion_speed
     travel_speed = nozzleboss.travel_speed
-
+    build_volume_x = nozzleboss.build_volume_x
+    build_volume_y = nozzleboss.build_volume_y
+    area_extrude = nozzleboss.area_extrude
+    z_height_extrude = nozzleboss.z_height_extrude
 
 
 
@@ -324,7 +363,8 @@ def export_gcode(context):
     verts = read_verts(obj.data)
     edges = read_edges(obj.data)
     #initial values
-    P2=(0,0,0)
+    P3=(0,0,0)
+    P_end=(0, 0, 0)
     prev_F=-1
     prev_tool_color = -1
 
@@ -352,13 +392,40 @@ def export_gcode(context):
                                   
     ##islands of extrusions vert indices
     for island in sorted_islands:
-        travel_dist = (Vector(verts[island[0]])-Vector(P2)).length #only retract when travel is longer than...
-        if travel_dist > 1:
-            _txt.append('G10 \n')
-        
-        #travel only from island to island    
-        _txt.append(travel(P2,verts[island[0]], travel_speed*60, extrusion_speed*60)) #verts[island[0]]=next coords
-        
+      
+        if area_extrude is True or z_height_extrude is True:
+            if offset is None:
+                first_layer_offset = (verts[island[0]]+verts[island[int(len(island)/2)]])/2
+                offset = np.array([build_volume_x/2, build_volume_y/2, first_layer_offset[2]])
+
+            P_new=(verts[island[0]]+verts[island[int(len(island)/2)]])/2+offset
+
+            travel_dist = (Vector(P_new)-Vector(P_end)).length #only retract when travel is longer than...
+            if travel_dist > 1:
+                _txt.append('G10 \n')
+            
+            #travel only from island to island    
+            _txt.append(travel(P_end, P_new, travel_speed*60, extrusion_speed*60)) #verts[island[0]]=next coords
+        else:
+            if offset is None:
+                offset = np.array([build_volume_x/2, build_volume_y/2, 0])
+            #travel_dist = (Vector(verts[island[0]]+offset)-Vector(P2)).length #only retract when travel is longer than...
+            if area_extrude is True or z_height_extrude is True:
+                travel_dist = (Vector((verts[island[0]]+verts[island[int(len(island)/2)]])/2+offset)-Vector(P3)).length #only retract when travel is longer than...
+            else:
+                travel_dist = (Vector((verts[island[int(len(island)/2)]])+offset)-Vector(P3)).length #only retract when travel is longer than...
+
+            
+            if travel_dist > 1:
+                _txt.append('G10 \n')
+            
+            #travel only from island to island    
+            #_txt.append(travel(P2,verts[island[0]]+offset, travel_speed*60, extrusion_speed*60)) #verts[island[0]]=next coords
+            if area_extrude is True or z_height_extrude is True:
+                _txt.append(travel(P3,(verts[island[0]]+verts[island[int(len(island)/2)]])/2+offset, travel_speed*60, extrusion_speed*60)) #verts[island[0]]=next coords
+            else:
+                _txt.append(travel(P3, verts[island[int(len(island)/2)]]+offset, travel_speed*60, extrusion_speed*60)) #verts[island[0]]=next coords
+
         if travel_dist > 1:
             _txt.append('G11 \n')   
             
@@ -372,31 +439,98 @@ def export_gcode(context):
 
             
             
+        
+        island_closed = shared_edge_boolean(bm.verts[e_edges[-1]], bm.verts[e_edges[0]])
         #extrude between all poitns in island
         for i in range(len(e_edges)): 
-            if i == len(e_edges)-1:#break on last segment, if you want to close segment, 'rip' the last vert
-              break
-              
+            if i == len(e_edges)-1 and not island_closed: #dont calc last seg on open island
+                break
+        
+            #exception on last segment if segment is closed grab info from first vert of island
+            if i == len(e_edges)-1:
+                P1 = verts[e_edges[i]]+offset
+                P2 = verts[e_edges[0]]+offset
+                P3 = verts[h_edges[0]]+offset
+                P4 = verts[h_edges[i]]+offset
+                P_start = (P1+P4)/2
+                P_end = (P2+P3)/2
+                width=nozzle_diameter*1.5
+                multiplier = extrusion_weights[e_edges[0]]#
+                multiplier = remap(multiplier, nozzleboss.min_flow, nozzleboss.max_flow)
 
-            #coord for seg length and height
-            P1 = verts[e_edges[i]]
-            P2 = verts[e_edges[i+1]]
-            P3 = verts[h_edges[i+1]] 
 
 
+                if area_extrude is True:
+                    seg_coords1 = [P1, P2, P3, P4]
+                    seg_coords2 = [P2, P3, P4, P1]
+                    seg_coords3 = [P3, P4, P1, P2]
+                    seg_coords4 = [P4, P1, P2, P3]
+                    area = max(poly_area(seg_coords1), poly_area(seg_coords2), poly_area(seg_coords3), poly_area(seg_coords4))
+                    E_volume=area*width*multiplier
+                else:
+                    if z_height_extrude is True:
+                        dist = np.linalg.norm(P_end-P_start)
+                        height=abs(P1[2]+P2[2]-P3[2]-P4[2])
+                    else:
+                        dist = np.linalg.norm(P3-P4)
+                        height=np.linalg.norm(P3-P2)                        
+                    E_volume=dist*height*width*multiplier
 
-    #calcE
-            dist = np.linalg.norm(P2-P1)
-            height=np.linalg.norm(P3-P2)
+                E=E_volume/2.405281875  ##E axis in mm not mm³, 2.405 is 1mm of 1.75mm filament (r*(PI*r), 0.875*PI*0.875
 
-            width=nozzle_diameter*1.5
-            multiplier = extrusion_weights[e_edges[i+1]]#
-            multiplier = remap(multiplier, nozzleboss.min_flow, nozzleboss.max_flow)
-            E_volume=dist*height*width*multiplier
+
+                #calcF
+
+                speed_weight =  remap(speed_weights[e_edges[i]], nozzleboss.min_speed, nozzleboss.max_speed)
+                F = extrusion_speed*speed_weight 
+
+                #check if tool color changed and append corresponding textblock
+                if tool_colors[e_edges[0]]!=prev_tool_color:
+
+                    if tool_colors[e_edges[0]]<0.5:
+                        _txt.append(read_textblock('T1'))
+                    else:
+                        _txt.append(read_textblock('T0'))  
+
+                    prev_tool_color=tool_colors[e_edges[0]]  
+
+
+            else: #usual case
+                #coord for seg length and height
+                P1 = verts[e_edges[i]]+offset
+                P2 = verts[e_edges[i+1]]+offset
+                P3 = verts[h_edges[i+1]]+offset
+                P4 = verts[h_edges[i]]+offset
+                P_start = (P1+P4)/2
+                P_end = (P2+P3)/2
+
+
+                #calcE
+                
+
+                width=nozzle_diameter*1.5
+                multiplier = extrusion_weights[e_edges[i+1]]#
+                multiplier = remap(multiplier, nozzleboss.min_flow, nozzleboss.max_flow)
+                if area_extrude is True:
+                    seg_coords1 = [P1, P2, P3, P4]
+                    seg_coords2 = [P2, P3, P4, P1]
+                    seg_coords3 = [P3, P4, P1, P2]
+                    seg_coords4 = [P4, P1, P2, P3]
+                    area = max(poly_area(seg_coords1), poly_area(seg_coords2) ,poly_area(seg_coords3) ,poly_area(seg_coords4))
+                
+                    E_volume=area*width*multiplier
+                else:
+                    if z_height_extrude is True:
+                        dist = np.linalg.norm(P_end-P_start)
+                        height=abs(P1[2]+P2[2]-P3[2]-P4[2])
+                    else:
+                        dist = np.linalg.norm(P3-P4)
+                        height=np.linalg.norm(P3-P2)                        
+                    E_volume=dist*height*width*multiplier
             E=E_volume/2.405281875  ##E axis in mm not mm³, 2.405 is 1mm of 1.75mm filament (r*(PI*r), 0.875*PI*0.875
 
 
-    #calcF
+            #calcF
 
             speed_weight =  remap(speed_weights[e_edges[i]], nozzleboss.min_speed, nozzleboss.max_speed)
             F = extrusion_speed*speed_weight 
@@ -412,7 +546,11 @@ def export_gcode(context):
                 prev_tool_color=tool_colors[e_edges[i+1]]   
 
 
-            _txt.append(extrude(P1, P2, E, F, prev_F)) 
+            if area_extrude is True or z_height_extrude is True:
+                _txt.append(extrude(P_start, P_end, E, F, prev_F)) 
+            else:
+                _txt.append(extrude(P4, P3, E, F, prev_F)) 
+
 
 
     #print(_txt)
