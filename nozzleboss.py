@@ -166,6 +166,7 @@ class gcode_settings(bpy.types.PropertyGroup):
         )
     
 
+    
 
 
 
@@ -261,7 +262,7 @@ class NOZZLEBOSS_PT_Panel(bpy.types.Panel):
         row=col.row(align=True)
         row.label(text='End G-code:')
         row.prop_search(nozzleboss, "end", bpy.data, "texts", text="")   
-      
+        
         col.separator(factor=2)
 
         row = col.row(align=True)
@@ -283,7 +284,35 @@ class NOZZLEBOSS_PT_Panel(bpy.types.Panel):
 
         
         
-    
+#unit normal vector of plane defined by points a, b, and c
+def unit_normal(a, b, c):
+    x = np.linalg.det([[1,a[1],a[2]],
+         [1,b[1],b[2]],
+         [1,c[1],c[2]]])
+    y = np.linalg.det([[a[0],1,a[2]],
+         [b[0],1,b[2]],
+         [c[0],1,c[2]]])
+    z = np.linalg.det([[a[0],a[1],1],
+         [b[0],b[1],1],
+         [c[0],c[1],1]])
+    magnitude = (x**2 + y**2 + z**2)**.5
+    return (x/magnitude, y/magnitude, z/magnitude)
+
+#area of polygon poly
+def poly_area(poly):
+    if len(poly) < 3: # not a plane - no area
+        return 0
+    total = [0, 0, 0]
+    N = len(poly)
+    for i in range(N):
+        vi1 = poly[i]
+        vi2 = poly[(i+1) % N]
+        prod = np.cross(vi1, vi2)
+        total[0] += prod[0]
+        total[1] += prod[1]
+        total[2] += prod[2]
+    result = np.dot(total, unit_normal(poly[0], poly[1], poly[2]))
+    return abs(result/2)          
 
 def import_gcode(context, filepath):
         scene = context.scene
@@ -357,17 +386,13 @@ def export_gcode(context):
     area_extrude = nozzleboss.area_extrude
     z_height_extrude = nozzleboss.z_height_extrude
 
-
-
     obj = bpy.context.active_object
     verts = read_verts(obj.data)
     edges = read_edges(obj.data)
-    #initial values
-    P3=(0,0,0)
-    P_end=(0, 0, 0)
-    prev_F=-1
-    prev_tool_color = -1
-
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
     #create vertex colors maps, most cases importer could already do that, but in case you have handdrawn/beveled extrusion path
     if not obj.data.vertex_colors.get('Flow'):
         obj.data.vertex_colors.new(name='Flow')
@@ -388,11 +413,16 @@ def export_gcode(context):
 
     islands = find_islands(edges)
     sorted_islands = sort_Z(islands, verts)
-                                  
-                                  
+    #initial values
+    P_end=(0, 0, 0)
+    P3=(0, 0, 0)
+    prev_F=-1
+    prev_tool_color = -1
+    offset = None        
+
     ##islands of extrusions vert indices
     for island in sorted_islands:
-      
+
         if area_extrude is True or z_height_extrude is True:
             if offset is None:
                 first_layer_offset = (verts[island[0]]+verts[island[int(len(island)/2)]])/2
@@ -438,8 +468,6 @@ def export_gcode(context):
         
 
             
-            
-        
         island_closed = shared_edge_boolean(bm.verts[e_edges[-1]], bm.verts[e_edges[0]])
         #extrude between all poitns in island
         for i in range(len(e_edges)): 
@@ -527,30 +555,29 @@ def export_gcode(context):
                         dist = np.linalg.norm(P3-P4)
                         height=np.linalg.norm(P3-P2)                        
                     E_volume=dist*height*width*multiplier
-            E=E_volume/2.405281875  ##E axis in mm not mm³, 2.405 is 1mm of 1.75mm filament (r*(PI*r), 0.875*PI*0.875
+
+                E=E_volume/2.405281875  ##E axis in mm not mm³, 2.405 is 1mm of 1.75mm filament (r*(PI*r), 0.875*PI*0.875
 
 
-            #calcF
+                #calcF
 
-            speed_weight =  remap(speed_weights[e_edges[i]], nozzleboss.min_speed, nozzleboss.max_speed)
-            F = extrusion_speed*speed_weight 
+                speed_weight =  remap(speed_weights[e_edges[i]], nozzleboss.min_speed, nozzleboss.max_speed)
+                F = extrusion_speed*speed_weight 
 
-            #check if tool color changed and append corresponding textblock
-            if tool_colors[e_edges[i+1]]!=prev_tool_color:
+                #check if tool color changed and append corresponding textblock
+                if tool_colors[e_edges[i+1]]!=prev_tool_color:
 
-                if tool_colors[e_edges[i+1]]<0.5:
-                    _txt.append(read_textblock('T1'))
-                else:
-                    _txt.append(read_textblock('T0'))  
+                    if tool_colors[e_edges[i+1]]<0.5:
+                        _txt.append(read_textblock('T1'))
+                    else:
+                        _txt.append(read_textblock('T0'))  
 
-                prev_tool_color=tool_colors[e_edges[i+1]]   
-
+                    prev_tool_color=tool_colors[e_edges[i+1]]   
 
             if area_extrude is True or z_height_extrude is True:
                 _txt.append(extrude(P_start, P_end, E, F, prev_F)) 
             else:
                 _txt.append(extrude(P4, P3, E, F, prev_F)) 
-
 
 
     #print(_txt)
